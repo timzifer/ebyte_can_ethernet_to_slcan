@@ -233,25 +233,28 @@ func encodeCANserverFrame(frame ebyte.Frame) ([]byte, error) {
 		remoteFlagMask   = uint32(1 << 30)
 	)
 
-	if frame.Extended {
+	extended := frame.Extended
+	if frame.ID > 0x7FF {
+		extended = true
+	}
+
+	if extended {
 		if frame.ID > 0x1FFFFFFF {
 			return nil, fmt.Errorf("invalid extended identifier 0x%x", frame.ID)
 		}
-	} else if frame.ID > 0x7FF {
-		return nil, fmt.Errorf("invalid standard identifier 0x%x", frame.ID)
 	}
 
 	// CANserver protocol v2 packs the 29-bit identifier across the two header words.
 	// The upper 11 bits occupy bits 21-31 of the first word, while the lower 21 bits
 	// are stored in the timestamp field (bits 0-20) when the extended flag is set.
 	header1 := (frame.ID & idMask) << idShift
-	if frame.Extended {
+	if extended {
 		upper := (frame.ID >> idShift) & uint32(idMask)
 		header1 = (upper << idShift) | (frame.ID & timestampMask)
 	}
 
 	header2 := uint32(frame.DLC & 0x0F)
-	if frame.Extended {
+	if extended {
 		header2 |= extendedFlagMask
 	}
 	if frame.Remote {

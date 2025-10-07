@@ -7,6 +7,7 @@ Diese Go-Anwendung verbindet einen EByte CAN-zu-Ethernet-Adapter mit Clients, di
 * Baut eine ausgehende TCP-Verbindung zum EByte CAN-zu-Ethernet-Adapter auf und versucht bei Fehlern automatisch eine Wiederverbindung.
 * Öffnet einen UDP-Listener, der eingehende CANserver-Frames entgegennimmt und Bestätigungen versendet.
 * Dekodiert empfangene Frames des Adapters (Standard- und Extended-Frames) und verteilt sie an alle aktuell verbundenen CANserver-Clients.
+  Dabei werden Identifier > 0x7FF automatisch als Extended Frames markiert, falls der Adapter das Flag nicht setzt.
 * Unterstützt sowohl das alte "hello"- als auch das neue "ehllo"-Handshake der CANserver-Protokollversionen 1 und 2.
 * Bietet strukturierte Logs mit konfigurierbaren Logleveln.
 

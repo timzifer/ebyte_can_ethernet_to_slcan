@@ -21,14 +21,14 @@ func ParseFrame(raw []byte) (Frame, error) {
 	}
 
 	header := raw[0]
-	if header&0x80 == 0 {
-		return Frame{}, fmt.Errorf("invalid frame header 0x%02x", header)
-	}
 
 	frame := Frame{}
 	frame.DLC = header & 0x0F
-	frame.Remote = header&0x10 != 0
-	frame.Extended = header&0x20 != 0
+	if frame.DLC > 8 {
+		return Frame{}, fmt.Errorf("invalid DLC %d", frame.DLC)
+	}
+	frame.Remote = header&0x40 != 0
+	frame.Extended = header&0x80 != 0
 
 	frame.ID = binary.BigEndian.Uint32(raw[1:5])
 	copy(frame.Data[:], raw[5:])
@@ -41,12 +41,12 @@ func SerializeFrame(frame Frame) ([]byte, error) {
 	}
 
 	buf := make([]byte, FrameSize)
-	header := uint8(0x80 | (frame.DLC & 0x0F))
+	header := frame.DLC & 0x0F
 	if frame.Remote {
-		header |= 0x10
+		header |= 0x40
 	}
 	if frame.Extended {
-		header |= 0x20
+		header |= 0x80
 	}
 	buf[0] = header
 	binary.BigEndian.PutUint32(buf[1:5], frame.ID)

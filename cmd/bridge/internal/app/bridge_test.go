@@ -99,14 +99,24 @@ func TestEncodeCANserverFrameErrors(t *testing.T) {
 		t.Fatalf("expected error for DLC > 8")
 	}
 
-	_, err = encodeCANserverFrame(ebyte.Frame{ID: 0x800})
-	if err == nil {
-		t.Fatalf("expected error for invalid standard identifier")
-	}
-
 	_, err = encodeCANserverFrame(ebyte.Frame{Extended: true, ID: 0x20000000})
 	if err == nil {
 		t.Fatalf("expected error for invalid extended identifier")
+	}
+}
+
+func TestEncodeCANserverFrameAutoExtended(t *testing.T) {
+	frame := ebyte.Frame{ID: 0x1ABCDE, DLC: 2}
+
+	data, err := encodeCANserverFrame(frame)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	header2 := binary.LittleEndian.Uint32(data[4:8])
+	const extendedFlag = uint32(1 << 31)
+	if header2&extendedFlag == 0 {
+		t.Fatalf("expected extended flag to be set for identifier 0x%x", frame.ID)
 	}
 }
 

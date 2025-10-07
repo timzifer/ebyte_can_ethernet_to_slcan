@@ -1,11 +1,11 @@
 package app
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"time"
@@ -17,17 +17,39 @@ type Bridge struct {
 	cfg Config
 
 	mu      sync.RWMutex
-	clients map[string]*client
+	clients map[*client]struct{}
 
 	logger Logger
 
-	packetConn net.PacketConn
+	listener net.Listener
+	start    time.Time
 }
 
 type client struct {
-	addr     net.Addr
-	version  int
-	lastSeen time.Time
+	conn      net.Conn
+	sendCh    chan []byte
+	done      chan struct{}
+	closeOnce sync.Once
+	remote    string
+}
+
+type gvretParserState int
+
+const (
+	gvretStateIdle gvretParserState = iota
+	gvretStateExpectCommand
+	gvretStateClassicFrame
+	gvretStateFdFrame
+	gvretStateSkip
+)
+
+type gvretClientState struct {
+	binary    bool
+	e7Count   int
+	state     gvretParserState
+	step      int
+	remaining int
+	fdLength  int
 }
 
 func New(cfg Config) (*Bridge, error) {
@@ -38,19 +60,20 @@ func New(cfg Config) (*Bridge, error) {
 
 	return &Bridge{
 		cfg:     cfg,
-		clients: make(map[string]*client),
+		clients: make(map[*client]struct{}),
 		logger:  logger,
+		start:   time.Now(),
 	}, nil
 }
 
 func (b *Bridge) Run(ctx context.Context) error {
-	packetConn, err := net.ListenPacket("udp", b.cfg.ListenAddress)
+	listener, err := net.Listen("tcp", b.cfg.ListenAddress)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", b.cfg.ListenAddress, err)
 	}
-	defer packetConn.Close()
-	b.packetConn = packetConn
-	b.logger.Infof("CANserver UDP server listening on %s", packetConn.LocalAddr())
+	defer listener.Close()
+	b.listener = listener
+	b.logger.Infof("GVRET TCP server listening on %s", listener.Addr())
 
 	errCh := make(chan error, 2)
 
@@ -59,149 +82,318 @@ func (b *Bridge) Run(ctx context.Context) error {
 	}()
 
 	go func() {
-		errCh <- b.handleClientPackets(ctx, packetConn)
+		errCh <- b.acceptClients(ctx, listener)
 	}()
 
-	cleanupTicker := time.NewTicker(5 * time.Second)
-	defer cleanupTicker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			b.logger.Infof("context cancelled")
-			return nil
-		case err := <-errCh:
-			return err
-		case <-cleanupTicker.C:
-			b.cleanupClients()
-		}
+	select {
+	case <-ctx.Done():
+		return nil
+	case err := <-errCh:
+		return err
 	}
 }
 
-func (b *Bridge) handleClientPackets(ctx context.Context, conn net.PacketConn) error {
-	buf := make([]byte, 1024)
+func (b *Bridge) acceptClients(ctx context.Context, listener net.Listener) error {
 	for {
-		if ctx.Err() != nil {
-			return nil
+		conn, err := listener.Accept()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			if ne, ok := err.(net.Error); ok && ne.Temporary() {
+				continue
+			}
+			return fmt.Errorf("accept client: %w", err)
 		}
 
-		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
-		n, addr, err := conn.ReadFrom(buf)
+		b.logger.Infof("client connected: %s", conn.RemoteAddr())
+		go b.handleClient(ctx, conn)
+	}
+}
+
+func (b *Bridge) handleClient(ctx context.Context, conn net.Conn) {
+	c := newClient(conn)
+	b.addClient(c)
+	defer func() {
+		b.removeClient(c)
+		b.logger.Infof("client disconnected: %s", c.remote)
+	}()
+
+	clientCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	go c.writer(clientCtx, b.logger)
+
+	state := gvretClientState{}
+	buf := make([]byte, 1024)
+
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+		n, err := conn.Read(buf)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
 				continue
 			}
-			if errors.Is(err, net.ErrClosed) {
-				return nil
+			if errors.Is(err, io.EOF) {
+				return
 			}
 			if ctx.Err() != nil {
-				return nil
+				return
 			}
-			return fmt.Errorf("read packet: %w", err)
+			b.logger.Warnf("client %s read error: %v", c.remote, err)
+			return
 		}
 
-		b.processClientDatagram(conn, addr, buf[:n])
+		for i := 0; i < n; i++ {
+			b.processGVRETByte(c, &state, buf[i])
+		}
 	}
 }
 
-func (b *Bridge) processClientDatagram(conn net.PacketConn, addr net.Addr, data []byte) {
-	if len(data) == 0 {
+func newClient(conn net.Conn) *client {
+	return &client{
+		conn:   conn,
+		sendCh: make(chan []byte, 128),
+		done:   make(chan struct{}),
+		remote: conn.RemoteAddr().String(),
+	}
+}
+
+func (c *client) writer(ctx context.Context, logger Logger) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-c.done:
+			return
+		case data := <-c.sendCh:
+			if len(data) == 0 {
+				continue
+			}
+			if _, err := c.conn.Write(data); err != nil {
+				if logger != nil {
+					logger.Debugf("write to %s failed: %v", c.remote, err)
+				}
+				c.close()
+				return
+			}
+		}
+	}
+}
+
+func (c *client) close() {
+	c.closeOnce.Do(func() {
+		close(c.done)
+		_ = c.conn.Close()
+	})
+}
+
+func (c *client) enqueue(payload []byte) {
+	data := append([]byte(nil), payload...)
+	select {
+	case <-c.done:
+		return
+	default:
+	}
+
+	select {
+	case c.sendCh <- data:
+	case <-c.done:
+	default:
+	}
+}
+
+func (c *client) enqueuePriority(payload []byte) {
+	data := append([]byte(nil), payload...)
+	select {
+	case <-c.done:
+		return
+	default:
+	}
+
+	select {
+	case c.sendCh <- data:
+	case <-c.done:
+	}
+}
+
+func (b *Bridge) addClient(c *client) {
+	b.mu.Lock()
+	b.clients[c] = struct{}{}
+	b.mu.Unlock()
+}
+
+func (b *Bridge) removeClient(c *client) {
+	b.mu.Lock()
+	if _, ok := b.clients[c]; ok {
+		delete(b.clients, c)
+	}
+	b.mu.Unlock()
+	c.close()
+}
+
+func (b *Bridge) processGVRETByte(c *client, state *gvretClientState, by byte) {
+	if !state.binary {
+		if by == 0xE7 {
+			state.e7Count++
+			if state.e7Count >= 2 {
+				state.binary = true
+				state.state = gvretStateIdle
+				state.e7Count = 0
+				b.logger.Debugf("client %s switched to GVRET binary mode", c.remote)
+			}
+		} else {
+			state.e7Count = 0
+		}
 		return
 	}
 
-	switch {
-	case bytes.EqualFold(data, []byte("hello")):
-		b.registerClient(conn, addr, 1)
-	case bytes.EqualFold(data, []byte("ehllo")):
-		b.registerClient(conn, addr, 2)
-	case bytes.EqualFold(data, []byte("bye")):
-		b.unregisterClient(addr)
+	switch state.state {
+	case gvretStateIdle:
+		if by == 0xF1 {
+			state.state = gvretStateExpectCommand
+		}
+	case gvretStateExpectCommand:
+		state.state = gvretStateIdle
+		state.step = 0
+		b.handleGVRETCommandByte(c, state, by)
+	case gvretStateClassicFrame:
+		state.step++
+		switch state.step {
+		case 1, 2, 3, 4, 5, 6, 7, 8:
+			// header bytes: timestamp and identifier
+		case 9:
+			length := int(by & 0x0F)
+			state.remaining = length + 1 // payload + terminator
+			if state.remaining <= 0 {
+				state.state = gvretStateIdle
+				state.step = 0
+			} else {
+				state.state = gvretStateSkip
+			}
+		default:
+			state.state = gvretStateIdle
+			state.step = 0
+		}
+	case gvretStateFdFrame:
+		state.step++
+		switch state.step {
+		case 1, 2, 3, 4, 5, 6, 7, 8:
+			// timestamp and identifier bytes
+		case 9:
+			state.fdLength = int(by & 0x3F)
+		case 10:
+			state.remaining = state.fdLength + 1 // data + trailing byte
+			if state.remaining <= 0 {
+				state.state = gvretStateIdle
+				state.step = 0
+			} else {
+				state.state = gvretStateSkip
+			}
+		default:
+			state.state = gvretStateIdle
+			state.step = 0
+		}
+	case gvretStateSkip:
+		state.remaining--
+		if state.remaining <= 0 {
+			state.state = gvretStateIdle
+			state.step = 0
+		}
+	}
+}
+
+func (b *Bridge) handleGVRETCommandByte(c *client, state *gvretClientState, cmd byte) {
+	switch cmd {
+	case 0x00:
+		state.state = gvretStateClassicFrame
+		state.step = 0
+	case 0x01:
+		b.sendGVRETTimeSync(c)
+	case 0x06:
+		b.sendGVRETBusParams(c)
+	case 0x07:
+		b.sendGVRETDeviceInfo(c)
+	case 0x09:
+		b.sendGVRETValidationAck(c)
+	case 0x0C:
+		b.sendGVRETNumBuses(c)
+	case 0x0D:
+		b.sendGVRETExtendedBusInfo(c)
+	case 0x05:
+		state.state = gvretStateSkip
+		state.remaining = 9
+	case 0x08:
+		state.state = gvretStateSkip
+		state.remaining = 2
+	case 0x14:
+		state.state = gvretStateFdFrame
+		state.step = 0
+		state.fdLength = 0
 	default:
-		b.touchClient(addr)
+		state.state = gvretStateIdle
 	}
 }
 
-func (b *Bridge) registerClient(conn net.PacketConn, addr net.Addr, version int) {
-	key := addr.String()
-
-	var isNew bool
-
-	b.mu.Lock()
-	c, ok := b.clients[key]
-	if !ok {
-		c = &client{addr: addr}
-		b.clients[key] = c
-		isNew = true
-	}
-	prevVersion := c.version
-	c.version = version
-	c.lastSeen = time.Now()
-	b.mu.Unlock()
-
-	if isNew {
-		b.logger.Infof("client connected: %s (protocol v%d)", addr, version)
-		if err := b.sendCANserverAck(conn, addr); err != nil {
-			b.logger.Warnf("failed to send ack to %s: %v", addr, err)
-		}
-	} else if prevVersion != version {
-		b.logger.Infof("client %s switched to protocol v%d", addr, version)
-	}
+func (b *Bridge) sendGVRETTimeSync(c *client) {
+	ts := b.gvretTimestamp()
+	payload := []byte{0xF1, 0x01, byte(ts), byte(ts >> 8), byte(ts >> 16), byte(ts >> 24)}
+	c.enqueuePriority(payload)
 }
 
-func (b *Bridge) unregisterClient(addr net.Addr) {
-	key := addr.String()
-	b.mu.Lock()
-	if _, ok := b.clients[key]; ok {
-		delete(b.clients, key)
-		b.logger.Infof("client disconnected: %s", addr)
+func (b *Bridge) sendGVRETBusParams(c *client) {
+	bitrate := b.cfg.BusBitrate
+	payload := []byte{
+		0xF1, 0x06,
+		0x01,
+		byte(bitrate), byte(bitrate >> 8), byte(bitrate >> 16), byte(bitrate >> 24),
+		0x00,
+		0x00, 0x00, 0x00, 0x00,
 	}
-	b.mu.Unlock()
+	c.enqueuePriority(payload)
 }
 
-func (b *Bridge) touchClient(addr net.Addr) {
-	key := addr.String()
-	b.mu.Lock()
-	if c, ok := b.clients[key]; ok {
-		c.lastSeen = time.Now()
-	}
-	b.mu.Unlock()
+func (b *Bridge) sendGVRETDeviceInfo(c *client) {
+	payload := []byte{0xF1, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00}
+	c.enqueuePriority(payload)
 }
 
-func (b *Bridge) cleanupClients() {
-	cutoff := time.Now().Add(-10 * time.Second)
-
-	b.mu.Lock()
-	for key, c := range b.clients {
-		if c.lastSeen.Before(cutoff) {
-			delete(b.clients, key)
-			b.logger.Infof("client timed out: %s", c.addr)
-		}
-	}
-	b.mu.Unlock()
+func (b *Bridge) sendGVRETNumBuses(c *client) {
+	payload := []byte{0xF1, 0x0C, 0x01}
+	c.enqueuePriority(payload)
 }
 
-func (b *Bridge) sendCANserverAck(conn net.PacketConn, addr net.Addr) error {
-	ack := make([]byte, 16)
-	binary.LittleEndian.PutUint32(ack[0:4], uint32(0x006<<21))
-	binary.LittleEndian.PutUint32(ack[4:8], uint32(15<<4))
-	_, err := conn.WriteTo(ack, addr)
-	return err
+func (b *Bridge) sendGVRETExtendedBusInfo(c *client) {
+	payload := make([]byte, 17)
+	payload[0] = 0xF1
+	payload[1] = 0x0D
+	c.enqueuePriority(payload)
+}
+
+func (b *Bridge) sendGVRETValidationAck(c *client) {
+	payload := []byte{0xF1, 0x09}
+	c.enqueuePriority(payload)
+}
+
+func (b *Bridge) gvretTimestamp() uint32 {
+	elapsed := time.Since(b.start)
+	return uint32(elapsed / time.Microsecond)
 }
 
 func (b *Bridge) broadcastFrame(frame ebyte.Frame) {
-	if b.packetConn == nil {
-		return
-	}
-
-	data, err := encodeCANserverFrame(frame)
+	data, err := encodeGVRETFrame(frame, b.gvretTimestamp(), 0)
 	if err != nil {
-		b.logger.Warnf("unable to encode frame: %v", err)
+		b.logger.Warnf("unable to encode GVRET frame: %v", err)
 		return
 	}
 
 	b.mu.RLock()
 	clients := make([]*client, 0, len(b.clients))
-	for _, c := range b.clients {
+	for c := range b.clients {
 		clients = append(clients, c)
 	}
 	b.mu.RUnlock()
@@ -211,60 +403,43 @@ func (b *Bridge) broadcastFrame(frame ebyte.Frame) {
 	}
 
 	for _, c := range clients {
-		if time.Since(c.lastSeen) > 10*time.Second {
-			continue
-		}
-		if _, err := b.packetConn.WriteTo(data, c.addr); err != nil {
-			b.logger.Warnf("failed to send frame to %s: %v", c.addr, err)
-		}
+		c.enqueue(data)
 	}
 }
 
-func encodeCANserverFrame(frame ebyte.Frame) ([]byte, error) {
+func encodeGVRETFrame(frame ebyte.Frame, timestamp uint32, bus uint8) ([]byte, error) {
 	if frame.DLC > 8 {
 		return nil, fmt.Errorf("invalid DLC %d", frame.DLC)
 	}
 
-	const (
-		idShift          = 21
-		idMask           = uint32(0x7FF)
-		timestampMask    = uint32(0x1FFFFF)
-		extendedFlagMask = uint32(1 << 31)
-		remoteFlagMask   = uint32(1 << 30)
-	)
-
-	extended := frame.Extended
-	if frame.ID > 0x7FF {
-		extended = true
-	}
-
-	if extended {
-		if frame.ID > 0x1FFFFFFF {
-			return nil, fmt.Errorf("invalid extended identifier 0x%x", frame.ID)
-		}
-	}
-
-	// CANserver protocol v2 packs the 29-bit identifier across the two header words.
-	// The upper 11 bits occupy bits 21-31 of the first word, while the lower 21 bits
-	// are stored in the timestamp field (bits 0-20) when the extended flag is set.
-	header1 := (frame.ID & idMask) << idShift
-	if extended {
-		upper := (frame.ID >> idShift) & uint32(idMask)
-		header1 = (upper << idShift) | (frame.ID & timestampMask)
-	}
-
-	header2 := uint32(frame.DLC & 0x0F)
-	if extended {
-		header2 |= extendedFlagMask
+	id := frame.ID
+	if frame.Extended || frame.ID > 0x7FF {
+		id |= 1 << 31
 	}
 	if frame.Remote {
-		header2 |= remoteFlagMask
+		id |= 1 << 30
 	}
 
-	buf := make([]byte, 16)
-	binary.LittleEndian.PutUint32(buf[0:4], header1)
-	binary.LittleEndian.PutUint32(buf[4:8], header2)
-	copy(buf[8:], frame.Data[:])
+	buf := make([]byte, 0, 13+int(frame.DLC))
+	buf = append(buf, 0xF1, 0x00)
+
+	tsBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(tsBytes, timestamp)
+	buf = append(buf, tsBytes...)
+
+	idBytes := make([]byte, 4)
+	binary.LittleEndian.PutUint32(idBytes, id)
+	buf = append(buf, idBytes...)
+
+	lengthByte := byte(frame.DLC & 0x0F)
+	lengthByte |= (bus & 0x0F) << 4
+	buf = append(buf, lengthByte)
+
+	if frame.DLC > 0 {
+		buf = append(buf, frame.Data[:frame.DLC]...)
+	}
+
+	buf = append(buf, 0x00)
 	return buf, nil
 }
 

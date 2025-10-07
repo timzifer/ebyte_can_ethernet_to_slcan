@@ -1,15 +1,15 @@
-# EByte CAN-Ethernet zu GVRET-Bridge
+# EByte CAN-Ethernet to GVRET Bridge
 
-Diese Go-Anwendung verbindet einen EByte CAN-zu-Ethernet-Adapter mit Clients, die das TCP-basierte GVRET-Protokoll (z. B. [SavvyCAN](https://github.com/collin80/SavvyCAN)) sprechen. Sie übersetzt kontinuierlich zwischen dem proprietären EByte-Binärformat und den GVRET-Nachrichten und hält sowohl die TCP-Verbindung zum Adapter als auch die GVRET-Session der Clients stabil.
+This Go application connects an EByte CAN-to-Ethernet adapter with clients that speak the TCP-based GVRET protocol (e.g. [SavvyCAN](https://github.com/collin80/SavvyCAN)). It continuously translates between the proprietary EByte binary format and GVRET messages while keeping both the TCP connection to the adapter and the GVRET session with clients alive.
 
-## Funktionsumfang
+## Features
 
-* Baut eine ausgehende TCP-Verbindung zum EByte CAN-zu-Ethernet-Adapter auf und versucht bei Fehlern automatisch eine Wiederverbindung.
-* Öffnet einen TCP-Listener, der GVRET-Clients akzeptiert, das GVRET-Handshake bedient und periodische Validierungsanfragen beantwortet.
-* Dekodiert empfangene Frames des Adapters (Standard- und Extended-Frames) und verteilt sie an alle aktuell verbundenen GVRET-Clients.
-  Dabei werden Identifier > 0x7FF automatisch als Extended Frames markiert, falls der Adapter das Flag nicht setzt.
-* Meldet dem Client eine konfigurierbare Busgeschwindigkeit und liefert GVRET-Zeitstempel auf Basis der Systemuhr.
-* Bietet strukturierte Logs mit konfigurierbaren Logleveln.
+* Establishes an outgoing TCP connection to the EByte CAN-to-Ethernet adapter and automatically retries when the link drops.
+* Opens a TCP listener that accepts GVRET clients, performs the GVRET handshake, and responds to periodic validation requests.
+* Decodes adapter frames (standard and extended) and distributes them to all currently connected GVRET clients.
+  Identifiers greater than 0x7FF are automatically flagged as extended frames if the adapter omits the flag.
+* Reports a configurable bus bitrate to the client and provides GVRET timestamps based on the system clock.
+* Offers structured logging with configurable log levels.
 
 ## Installation & Build
 
@@ -17,15 +17,15 @@ Diese Go-Anwendung verbindet einen EByte CAN-zu-Ethernet-Adapter mit Clients, di
 go build ./cmd/bridge
 ```
 
-Der resultierende Binärname kann optional mit `-o` angepasst werden:
+The name of the resulting binary can optionally be adjusted via `-o`:
 
 ```bash
 go build -o ebyte-canserver-bridge ./cmd/bridge
 ```
 
-## Ausführung
+## Usage
 
-Alle Optionen werden ausschließlich per CLI-Flags konfiguriert:
+All options are configured via CLI flags only:
 
 ```bash
 ./ebyte-canserver-bridge \
@@ -38,30 +38,30 @@ Alle Optionen werden ausschließlich per CLI-Flags konfiguriert:
   -log-level info
 ```
 
-### Wichtige Flags
+### Important Flags
 
-| Flag | Standardwert | Beschreibung |
-|------|---------------|--------------|
-| `-ebyte-host` | `127.0.0.1` | Hostname oder IP des EByte-Adapters |
-| `-ebyte-port` | `4001` | TCP-Port des Adapters |
-| `-listen-host` | `0.0.0.0` | Adresse, an die der GVRET-TCP-Server bindet |
-| `-listen-port` | `23` | Port des TCP-Servers |
-| `-can-bitrate` | `500000` | Gemeldete CAN-Bitrate für GVRET-Clients (in bit/s) |
-| `-reconnect-delay` | `2s` | Wartezeit, bevor nach Verbindungsverlust erneut verbunden wird |
-| `-log-level` | `info` | Loglevel: `debug`, `info`, `warn`, `error` |
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-ebyte-host` | `127.0.0.1` | Hostname or IP address of the EByte adapter |
+| `-ebyte-port` | `4001` | TCP port of the adapter |
+| `-listen-host` | `0.0.0.0` | Address the GVRET TCP server binds to |
+| `-listen-port` | `23` | Port of the TCP server |
+| `-can-bitrate` | `500000` | CAN bitrate reported to GVRET clients (in bit/s) |
+| `-reconnect-delay` | `2s` | Waiting time before reconnecting after a disconnect |
+| `-log-level` | `info` | Log level: `debug`, `info`, `warn`, `error` |
 
-## Nutzung mit SavvyCAN
+## Using SavvyCAN
 
-Nach dem Start der Bridge kann SavvyCAN unter "Connection" → "Connect" die Option **GVRET** wählen und die in `listen-host:listen-port` konfigurierte Adresse angeben. Die Bridge beantwortet das GVRET-Handshake (inklusive Validierungspakete) und verteilt danach die vom Adapter empfangenen CAN-Frames an alle verbundenen Clients.
+After starting the bridge, choose **GVRET** under "Connection" → "Connect" in SavvyCAN and point it to the `listen-host:listen-port` pair. The bridge completes the GVRET handshake (including validation packets) and then forwards the CAN frames received from the adapter to all connected clients.
 
 ## Tests
 
-Zum Ausführen der vorhandenen Unit-Tests:
+Run the available unit tests with:
 
 ```bash
 go test ./...
 ```
 
-## Lizenz
+## License
 
-Die Software steht unter der MIT-Lizenz. Details siehe [LICENSE](LICENSE).
+The software is licensed under the MIT License. See [LICENSE](LICENSE) for details.

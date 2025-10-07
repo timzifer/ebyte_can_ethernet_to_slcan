@@ -13,6 +13,9 @@ type Command struct {
 	Raw  string
 }
 
+// ParseCommand inspects the ASCII command string sent by a GVRET client and
+// categorises it into a known command type. Unknown commands are reported with
+// their raw representation so the caller can decide how to handle them.
 func ParseCommand(raw string) Command {
 	if raw == "" {
 		return Command{Type: CommandUnknown, Raw: raw}

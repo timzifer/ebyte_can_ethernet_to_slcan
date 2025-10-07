@@ -18,9 +18,13 @@ const (
 )
 
 type Logger interface {
+	// Debugf logs a debug-level message.
 	Debugf(format string, args ...any)
+	// Infof logs an info-level message.
 	Infof(format string, args ...any)
+	// Warnf logs a warning message.
 	Warnf(format string, args ...any)
+	// Errorf logs an error-level message.
 	Errorf(format string, args ...any)
 }
 
@@ -29,6 +33,8 @@ type stdLogger struct {
 	l     *log.Logger
 }
 
+// NewLogger creates a logger instance that writes to stdout with the requested
+// minimum level.
 func NewLogger(level string) (Logger, error) {
 	lvl, err := parseLevel(level)
 	if err != nil {
@@ -40,6 +46,7 @@ func NewLogger(level string) (Logger, error) {
 	return sl, nil
 }
 
+// parseLevel converts the textual representation into the internal log level.
 func parseLevel(level string) (LogLevel, error) {
 	switch strings.ToLower(level) {
 	case "debug":

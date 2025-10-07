@@ -106,3 +106,24 @@ func TestSerializeFrameRemote(t *testing.T) {
 		t.Fatalf("unexpected identifier: got 0x%x want 0x%x", parsed.ID, frame.ID)
 	}
 }
+
+func TestParseFrameInvalidSize(t *testing.T) {
+	if _, err := ParseFrame([]byte{0x00}); err == nil {
+		t.Fatalf("expected error for truncated frame")
+	}
+}
+
+func TestParseFrameInvalidDLC(t *testing.T) {
+	raw := []byte{0x89}
+	raw = append(raw, make([]byte, FrameSize-1)...)
+	if _, err := ParseFrame(raw); err == nil {
+		t.Fatalf("expected error for DLC > 8")
+	}
+}
+
+func TestSerializeFrameInvalidDLC(t *testing.T) {
+	_, err := SerializeFrame(Frame{DLC: 9})
+	if err == nil {
+		t.Fatalf("expected error for invalid DLC")
+	}
+}

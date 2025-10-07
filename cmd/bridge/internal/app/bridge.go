@@ -1,3 +1,5 @@
+// Package app contains the runtime logic that bridges between the EByte
+// adapter connection and GVRET clients.
 package app
 
 import (
@@ -13,6 +15,8 @@ import (
 	"github.com/example/ebyte_can_ethernet_to_slcan/cmd/bridge/internal/ebyte"
 )
 
+// Bridge coordinates the TCP connections to the adapter and connected clients
+// and translates between the respective protocols.
 type Bridge struct {
 	cfg Config
 
@@ -52,6 +56,8 @@ type gvretClientState struct {
 	fdLength  int
 }
 
+// New constructs a Bridge using the provided configuration and initialises the
+// logging backend.
 func New(cfg Config) (*Bridge, error) {
 	logger, err := NewLogger(cfg.LogLevel)
 	if err != nil {
@@ -66,6 +72,8 @@ func New(cfg Config) (*Bridge, error) {
 	}, nil
 }
 
+// Run starts the bridge and blocks until the context is cancelled or a fatal
+// error occurs.
 func (b *Bridge) Run(ctx context.Context) error {
 	listener, err := net.Listen("tcp", b.cfg.ListenAddress)
 	if err != nil {
@@ -111,6 +119,7 @@ func (b *Bridge) acceptClients(ctx context.Context, listener net.Listener) error
 	}
 }
 
+// handleClient manages the lifecycle of a single GVRET client connection.
 func (b *Bridge) handleClient(ctx context.Context, conn net.Conn) {
 	c := newClient(conn)
 	b.addClient(c)
@@ -163,6 +172,7 @@ func newClient(conn net.Conn) *client {
 	}
 }
 
+// writer streams queued payloads to the client connection until cancelled.
 func (c *client) writer(ctx context.Context, logger Logger) {
 	for {
 		select {
@@ -192,6 +202,7 @@ func (c *client) close() {
 	})
 }
 
+// enqueue pushes payload data onto the client's write queue without blocking.
 func (c *client) enqueue(payload []byte) {
 	data := append([]byte(nil), payload...)
 	select {
@@ -207,6 +218,7 @@ func (c *client) enqueue(payload []byte) {
 	}
 }
 
+// enqueuePriority injects a payload ahead of regular queue traffic.
 func (c *client) enqueuePriority(payload []byte) {
 	data := append([]byte(nil), payload...)
 	select {
@@ -236,6 +248,8 @@ func (b *Bridge) removeClient(c *client) {
 	c.close()
 }
 
+// processGVRETByte feeds a single byte into the GVRET binary state machine and
+// triggers responses for recognised commands.
 func (b *Bridge) processGVRETByte(c *client, state *gvretClientState, by byte) {
 	if !state.binary {
 		if by == 0xE7 {
@@ -307,6 +321,8 @@ func (b *Bridge) processGVRETByte(c *client, state *gvretClientState, by byte) {
 	}
 }
 
+// handleGVRETCommandByte interprets the command byte that follows the GVRET
+// prefix and updates the parser state or sends control responses.
 func (b *Bridge) handleGVRETCommandByte(c *client, state *gvretClientState, cmd byte) {
 	switch cmd {
 	case 0x00:
@@ -339,12 +355,15 @@ func (b *Bridge) handleGVRETCommandByte(c *client, state *gvretClientState, cmd 
 	}
 }
 
+// sendGVRETTimeSync reports the current timestamp relative to the bridge
+// startup in microseconds.
 func (b *Bridge) sendGVRETTimeSync(c *client) {
 	ts := b.gvretTimestamp()
 	payload := []byte{0xF1, 0x01, byte(ts), byte(ts >> 8), byte(ts >> 16), byte(ts >> 24)}
 	c.enqueuePriority(payload)
 }
 
+// sendGVRETBusParams informs the client about the configured CAN bus bitrate.
 func (b *Bridge) sendGVRETBusParams(c *client) {
 	bitrate := b.cfg.BusBitrate
 	payload := []byte{
@@ -357,16 +376,20 @@ func (b *Bridge) sendGVRETBusParams(c *client) {
 	c.enqueuePriority(payload)
 }
 
+// sendGVRETDeviceInfo returns a minimal GVRET device descriptor payload.
 func (b *Bridge) sendGVRETDeviceInfo(c *client) {
 	payload := []byte{0xF1, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00}
 	c.enqueuePriority(payload)
 }
 
+// sendGVRETNumBuses indicates that a single CAN bus is available.
 func (b *Bridge) sendGVRETNumBuses(c *client) {
 	payload := []byte{0xF1, 0x0C, 0x01}
 	c.enqueuePriority(payload)
 }
 
+// sendGVRETExtendedBusInfo provides additional bus metadata as expected by
+// GVRET clients.
 func (b *Bridge) sendGVRETExtendedBusInfo(c *client) {
 	payload := make([]byte, 17)
 	payload[0] = 0xF1
@@ -374,16 +397,21 @@ func (b *Bridge) sendGVRETExtendedBusInfo(c *client) {
 	c.enqueuePriority(payload)
 }
 
+// sendGVRETValidationAck acknowledges the client's periodic keep-alive check.
 func (b *Bridge) sendGVRETValidationAck(c *client) {
 	payload := []byte{0xF1, 0x09}
 	c.enqueuePriority(payload)
 }
 
+// gvretTimestamp returns the elapsed time since the bridge started in
+// microseconds, matching GVRET's expectation.
 func (b *Bridge) gvretTimestamp() uint32 {
 	elapsed := time.Since(b.start)
 	return uint32(elapsed / time.Microsecond)
 }
 
+// broadcastFrame encodes an adapter frame into GVRET format and enqueues it for
+// all connected clients.
 func (b *Bridge) broadcastFrame(frame ebyte.Frame) {
 	data, err := encodeGVRETFrame(frame, b.gvretTimestamp(), 0)
 	if err != nil {
@@ -407,6 +435,8 @@ func (b *Bridge) broadcastFrame(frame ebyte.Frame) {
 	}
 }
 
+// encodeGVRETFrame assembles a GVRET binary frame message from the bridge's
+// internal frame representation.
 func encodeGVRETFrame(frame ebyte.Frame, timestamp uint32, bus uint8) ([]byte, error) {
 	if frame.DLC > 8 {
 		return nil, fmt.Errorf("invalid DLC %d", frame.DLC)
@@ -443,6 +473,8 @@ func encodeGVRETFrame(frame ebyte.Frame, timestamp uint32, bus uint8) ([]byte, e
 	return buf, nil
 }
 
+// runAdapterLoop keeps attempting to connect to the adapter until successful or
+// the context is cancelled.
 func (b *Bridge) runAdapterLoop(ctx context.Context) error {
 	for {
 		if err := b.connectAndServe(ctx); err != nil {
@@ -457,6 +489,8 @@ func (b *Bridge) runAdapterLoop(ctx context.Context) error {
 	}
 }
 
+// connectAndServe maintains the adapter session and broadcasts received frames
+// until an error occurs.
 func (b *Bridge) connectAndServe(ctx context.Context) error {
 	conn, err := net.Dial("tcp", b.cfg.EByteAddress)
 	if err != nil {

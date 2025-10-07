@@ -1,3 +1,5 @@
+// Package slcan implements helpers for the serial CAN (SLCAN) textual
+// protocol that GVRET clients understand.
 package slcan
 
 import (
@@ -7,6 +9,8 @@ import (
 	"github.com/example/ebyte_can_ethernet_to_slcan/cmd/bridge/internal/ebyte"
 )
 
+// EncodeFrame converts an internal CAN frame into the ASCII SLCAN string that
+// GVRET-compatible clients expect.
 func EncodeFrame(frame ebyte.Frame) string {
 	var builder strings.Builder
 	switch {

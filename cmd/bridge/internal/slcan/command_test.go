@@ -20,3 +20,11 @@ func TestParseCommand(t *testing.T) {
 		}
 	}
 }
+
+func TestParseCommandKeepsRaw(t *testing.T) {
+	input := "O123"
+	cmd := ParseCommand(input)
+	if cmd.Raw != input {
+		t.Fatalf("expected raw command to be preserved, got %q", cmd.Raw)
+	}
+}
